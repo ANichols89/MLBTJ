@@ -4,7 +4,6 @@
 """
 MLB pitch + event pipeline (API-first, SQLite output)
 
-Changes vs. CSV version:
 - Writes TWO tables to SQLite: `events` and `pitches`
 - Adds a `year` column (== season) to both tables
 - No CSV files are produced
@@ -311,16 +310,16 @@ def _sqlite_type_from_dtype(dtype) -> str:
         return "INTEGER"  # 0/1
     return "TEXT"
 
+
 def ensure_table_exists_and_expand(conn, table: str, df: pd.DataFrame):
     """
     Create table if not exists (via pandas on first write).
     If the table exists and df has new columns, ALTER TABLE to add them.
     """
-    # Check existing columns
     cols = conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()
-    existing = {row[1] for row in cols}  # row[1] = name
+    existing = {row[1] for row in cols}  # row[1] = column name
     if not existing:
-        # Table doesn't exist yet — create with to_sql (replace to be explicit)
+        # Table doesn't exist yet — create with current schema
         df.head(0).to_sql(table, conn, if_exists="replace", index=False)
         existing = set(df.columns)
 
@@ -329,25 +328,51 @@ def ensure_table_exists_and_expand(conn, table: str, df: pd.DataFrame):
         sql_type = _sqlite_type_from_dtype(df[c].dtype)
         conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{c}" {sql_type}'))
 
+
+def _sqlite_safe_chunksize(ncols: int, max_params: int = 999) -> int:
+    """
+    For SQLite's ~999-parameter limit, pick a rows-per-batch so that
+    rows * ncols <= max_params. Guarantee at least 1 row per batch.
+    """
+    return max(1, max_params // max(1, ncols))
+
+
 def write_df_append(engine, table: str, df: pd.DataFrame):
-    """Append df into table, expanding schema if new columns appear."""
+    """Append df into table, expanding schema if new columns appear, respecting SQLite param cap."""
     if df.empty:
         return
+
+    ncols = len(df.columns)
+    safe_chunk = _sqlite_safe_chunksize(ncols)  # e.g., with 120 cols → 8 rows/batch
+
     with engine.begin() as conn:
         ensure_table_exists_and_expand(conn, table, df)
-        df.to_sql(
-            name=table,
-            con=conn,
-            if_exists="append",
-            index=False,
-            chunksize=50_000,
-            method="multi",
-        )
-        # helpful index on year if present
+
+        try:
+            # Fast path: multi-row INSERTs within SQLite's param cap
+            df.to_sql(
+                name=table,
+                con=conn,
+                if_exists="append",
+                index=False,
+                chunksize=safe_chunk,
+                method="multi",
+            )
+        except Exception:
+            # Fallback: row-at-a-time if something still complains (slower but robust)
+            df.to_sql(
+                name=table,
+                con=conn,
+                if_exists="append",
+                index=False,
+                chunksize=1,
+                method=None,
+            )
+
+        # helpful indices
         if "year" in df.columns:
             conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{table}_year ON "{table}" ("year")'))
         if table == "pitches":
-            # common query keys
             for col in ("game_pk", "at_bat_index", "pitch_number"):
                 if col in df.columns:
                     conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{table}_{col} ON "{table}" ("{col}")'))
@@ -436,9 +461,15 @@ def build_for_season(season: int, engine):
 def main():
     ensure_dirs()
 
-    # fresh DB each run: drop tables if they exist (optional; comment out if you want true append)
     engine = create_engine(f"sqlite:///{os.path.abspath(DB_PATH)}", future=True)
+
+    # Pragmas for better write throughput
     with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+        conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+        conn.exec_driver_sql("PRAGMA temp_store=MEMORY;")
+
+        # fresh DB each run: drop tables if they exist (optional; comment out to keep appending)
         conn.execute(text('DROP TABLE IF EXISTS "events"'))
         conn.execute(text('DROP TABLE IF EXISTS "pitches"'))
 
